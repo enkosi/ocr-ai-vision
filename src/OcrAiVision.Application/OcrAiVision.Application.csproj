@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Application Business Rules (use cases) and the ports they depend on.
+    Depends inward on Domain only; frameworks and drivers stay outside.
+  -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\OcrAiVision.Domain\OcrAiVision.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!--
+    The composition root and the HTTP driving adapter. This is the ONLY project
+    allowed to reference Infrastructure, and it does so purely to wire the
+    container in Program.cs.
+  -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\OcrAiVision.Application\OcrAiVision.Application.csproj" />
+    <ProjectReference Include="..\OcrAiVision.Infrastructure\OcrAiVision.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Swashbuckle.AspNetCore" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="OcrAiVision.Api.UnitTests" />
+  </ItemGroup>
+
+</Project>

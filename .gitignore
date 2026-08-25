@@ -1,0 +1,18 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+TestResults/
+*.user
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+
+# Local configuration and secrets
+appsettings.Local.json
+*.env
