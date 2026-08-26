@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Enterprise Business Rules (Clean Architecture, innermost circle).
+
+    This project intentionally has ZERO package and project references. If a
+    dependency ever needs to be added here, the abstraction almost certainly
+    belongs in the Application layer instead.
+  -->
+
+</Project>
