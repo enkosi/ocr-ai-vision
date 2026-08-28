@@ -163,6 +163,44 @@ dotnet run --project src/OcrAiVision.Api
 
 Then open `http://localhost:5133/swagger`.
 
+## Deployment
+
+Azure resources are provisioned by Bicep and applied by pipelines — nothing is
+created by hand, including the resource group and the RBAC assignment that lets
+the app authenticate without a key.
+
+```
+infra/main.bicep ──┬─ modules/monitoring.bicep              Log Analytics + App Insights
+                   ├─ modules/document-intelligence.bicep   the AI account
+                   ├─ modules/app-service.bicep             Linux plan, web app, staging slot
+                   └─ modules/cognitive-services-role.bicep app identity → AI account
+
+infra/params/{dev,test,prod}.bicepparam   the only per-environment difference
+```
+
+One template, three parameter files, and a pipeline that builds once and
+promotes the same artifact:
+
+```
+Build ──► Validate ──► Dev ──► Test ──► [approval] ──► Prod (slot swap)
+```
+
+Both dialects are included: `.github/workflows/` for GitHub Actions and
+`azure-pipelines.yml` + `.azuredevops/templates/` for Azure DevOps.
+
+```bash
+./scripts/setup-github-oidc.sh <subscription-id>   # one-time, passwordless auth
+./scripts/deploy-infra.sh dev --what-if            # preview a template change
+./scripts/deploy-infra.sh dev                      # apply it
+```
+
+The web app runs with a system-assigned managed identity and no
+`DocumentIntelligence:ApiKey`, so the adapter falls through to
+`DefaultAzureCredential` — there is no key to store or rotate.
+
+**[docs/azure-cicd.md](docs/azure-cicd.md)** explains the templates, the stages,
+the OIDC trust and the one-time setup in full.
+
 ## Tests
 
 ```bash

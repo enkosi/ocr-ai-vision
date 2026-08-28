@@ -1,0 +1,112 @@
+# =============================================================================
+#  CD — build once, then promote the same artifact through dev, test and prod.
+#
+#  The promotion order is expressed with 'needs:', so test cannot start until
+#  dev succeeded and prod cannot start until test did. Approval before prod is
+#  a setting on the 'prod' GitHub Environment, not a step in this file.
+# =============================================================================
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '*.pptx'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy a single environment instead of the full chain.'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, dev, test, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # Never let two deployments of the same branch overlap — a half-applied
+  # template racing another one is how environments drift.
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore, build, test
+        run: |
+          dotnet restore OcrAiVision.sln
+          dotnet build OcrAiVision.sln --configuration Release --no-restore
+          dotnet test OcrAiVision.sln --configuration Release --no-build
+
+      # Published once, deployed three times. The bytes that pass the dev smoke
+      # test are the exact bytes that reach production — no per-environment
+      # rebuild, so nothing can differ between them but configuration.
+      - name: Publish
+        run: |
+          dotnet publish src/OcrAiVision.Api/OcrAiVision.Api.csproj \
+            --configuration Release \
+            --no-build \
+            --output ${{ runner.temp }}/publish
+
+      - name: Package
+        run: |
+          cd ${{ runner.temp }}/publish
+          zip -r ${{ runner.temp }}/OcrAiVision.Api.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-package
+          path: ${{ runner.temp }}/OcrAiVision.Api.zip
+          retention-days: 30
+
+  dev:
+    name: Deploy dev
+    needs: build
+    if: ${{ contains(fromJSON('["all","dev"]'), github.event.inputs.environment || 'all') }}
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: dev
+    secrets: inherit
+
+  # 'always()' plus an explicit result check is what lets a single-environment
+  # manual run reach test or prod with dev skipped, while still refusing to
+  # promote past a stage that actually failed.
+  test:
+    name: Deploy test
+    needs: [build, dev]
+    if: >-
+      ${{ always()
+          && needs.build.result == 'success'
+          && needs.dev.result != 'failure'
+          && needs.dev.result != 'cancelled'
+          && contains(fromJSON('["all","test"]'), github.event.inputs.environment || 'all') }}
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: test
+    secrets: inherit
+
+  prod:
+    name: Deploy prod
+    needs: [build, test]
+    if: >-
+      ${{ always()
+          && needs.build.result == 'success'
+          && needs.test.result != 'failure'
+          && needs.test.result != 'cancelled'
+          && contains(fromJSON('["all","prod"]'), github.event.inputs.environment || 'all') }}
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: prod
+    secrets: inherit

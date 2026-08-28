@@ -1,0 +1,166 @@
+# =============================================================================
+#  Reusable deployment workflow — one environment, called once per stage.
+#
+#  Called by cd.yml for dev, then test, then prod. Everything that differs
+#  between them is an input or a GitHub Environment setting, so the deployment
+#  procedure itself is written once.
+#
+#  Order matters inside a stage:
+#    1. what-if   — print the diff Azure is about to apply
+#    2. infra     — deploy Bicep, read the resource names back out of it
+#    3. app       — push the zip to those names
+#    4. smoke     — prove /health answers before anything is swapped live
+#    5. swap      — only where a staging slot exists (prod)
+# =============================================================================
+name: Deploy environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'dev | test | prod — selects the GitHub Environment and the .bicepparam file.'
+        required: true
+        type: string
+      location:
+        description: 'Azure region for the subscription-scoped deployment metadata.'
+        required: false
+        default: 'southafricanorth'
+        type: string
+      artifact-name:
+        description: 'Name of the build artifact to deploy.'
+        required: false
+        default: 'api-package'
+        type: string
+    outputs:
+      web-app-url:
+        description: 'Public URL of the deployed app.'
+        value: ${{ jobs.deploy.outputs.web-app-url }}
+
+permissions:
+  contents: read
+  id-token: write # Required for the OIDC token exchange in azure/login.
+
+jobs:
+  deploy:
+    name: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # The GitHub Environment is what carries the credentials AND the approval
+    # gate. Putting "required reviewers" on the prod environment is what makes
+    # this pipeline stop and wait for a human, without a line of YAML here.
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.infra.outputs.webAppUrl }}
+    outputs:
+      web-app-url: ${{ steps.infra.outputs.webAppUrl }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download API package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./package
+
+      # No secrets, no passwords: GitHub mints a short-lived OIDC token, Azure
+      # trades it for an access token because the federated credential on the
+      # app registration trusts this repository and this environment.
+      - name: Sign in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # A what-if is a dry run: it reports Create/Modify/Delete/NoChange per
+      # resource. Running it before the real deployment means the log shows what
+      # changed even when the deployment itself succeeds silently.
+      - name: Preview infrastructure changes (what-if)
+        run: |
+          az deployment sub what-if \
+            --name "ocrai-${{ inputs.environment }}-whatif-${{ github.run_number }}" \
+            --location "${{ inputs.location }}" \
+            --parameters "infra/params/${{ inputs.environment }}.bicepparam" \
+            --result-format FullResourcePayloads \
+            --no-pretty-print > whatif.json || true
+          az deployment sub what-if \
+            --name "ocrai-${{ inputs.environment }}-whatif-${{ github.run_number }}" \
+            --location "${{ inputs.location }}" \
+            --parameters "infra/params/${{ inputs.environment }}.bicepparam"
+
+      - name: Deploy infrastructure
+        id: infra
+        run: |
+          set -euo pipefail
+
+          # The template file is inferred from the 'using' statement inside the
+          # .bicepparam, which is why --template-file is absent here.
+          outputs=$(az deployment sub create \
+            --name "ocrai-${{ inputs.environment }}-${{ github.run_number }}" \
+            --location "${{ inputs.location }}" \
+            --parameters "infra/params/${{ inputs.environment }}.bicepparam" \
+            --query properties.outputs \
+            --output json)
+
+          echo "$outputs" | jq -r 'to_entries[] | "\(.key)=\(.value.value)"' >> "$GITHUB_OUTPUT"
+          echo "$outputs" | jq -r 'to_entries[] | "\(.key) = \(.value.value)"'
+
+      # Deploying into the slot rather than the live site is the whole point of
+      # having one: the new build starts, warms up and answers /health while
+      # production keeps serving the old build.
+      - name: Deploy API
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ steps.infra.outputs.webAppName }}
+          slot-name: ${{ steps.infra.outputs.webAppSlotName || 'production' }}
+          package: ./package/OcrAiVision.Api.zip
+
+      - name: Smoke test /health
+        run: |
+          set -euo pipefail
+          app="${{ steps.infra.outputs.webAppName }}"
+          slot="${{ steps.infra.outputs.webAppSlotName }}"
+          if [ -n "$slot" ]; then
+            target="https://${app}-${slot}.azurewebsites.net/health"
+          else
+            target="https://${app}.azurewebsites.net/health"
+          fi
+
+          echo "Probing ${target}"
+          for attempt in $(seq 1 20); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$target" || echo 000)
+            if [ "$status" = "200" ]; then
+              echo "Healthy after ${attempt} attempt(s)."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: HTTP ${status} — retrying in 15s"
+            sleep 15
+          done
+
+          echo "::error::${target} never returned 200."
+          exit 1
+
+      # The swap is an in-place exchange of the two slots' routing, so the new
+      # build goes live already warm. If it misbehaves, 'az webapp deployment
+      # slot swap --action swap' back is the rollback.
+      - name: Swap staging into production
+        if: steps.infra.outputs.webAppSlotName != ''
+        run: |
+          az webapp deployment slot swap \
+            --resource-group "${{ steps.infra.outputs.resourceGroupName }}" \
+            --name "${{ steps.infra.outputs.webAppName }}" \
+            --slot "${{ steps.infra.outputs.webAppSlotName }}" \
+            --target-slot production
+
+      - name: Verify production after swap
+        if: steps.infra.outputs.webAppSlotName != ''
+        run: |
+          set -euo pipefail
+          target="${{ steps.infra.outputs.webAppUrl }}/health"
+          for attempt in $(seq 1 10); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$target" || echo 000)
+            [ "$status" = "200" ] && { echo "Production healthy."; exit 0; }
+            echo "Attempt ${attempt}: HTTP ${status} — retrying in 10s"
+            sleep 10
+          done
+          echo "::error::Production did not come back healthy after the swap."
+          exit 1

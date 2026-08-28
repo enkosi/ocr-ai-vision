@@ -1,0 +1,54 @@
+# -----------------------------------------------------------------------------
+#  Validate stage — the infrastructure equivalent of a compile and a code
+#  review. 'az deployment sub validate' asks ARM to check the template it would
+#  actually receive; 'what-if' prints the resource-by-resource diff.
+# -----------------------------------------------------------------------------
+parameters:
+  - name: serviceConnection
+    type: string
+  - name: location
+    type: string
+  - name: vmImage
+    type: string
+    default: ubuntu-latest
+
+stages:
+  - stage: Validate
+    displayName: Validate infrastructure
+    dependsOn: []   # No dependency on Build — these two run side by side.
+    jobs:
+      - job: ValidateJob
+        displayName: Lint, validate and preview
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          - checkout: self
+
+          - script: |
+              set -euo pipefail
+              az bicep install
+              az bicep build --file infra/main.bicep --stdout > /dev/null
+              for environment in dev test prod; do
+                az bicep build-params --file "infra/params/${environment}.bicepparam" --stdout > /dev/null
+                echo "${environment}.bicepparam compiled"
+              done
+            displayName: Compile and lint Bicep
+
+          - task: AzureCLI@2
+            displayName: Validate and what-if (dev)
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az deployment sub validate \
+                  --name "ocrai-validate-$(Build.BuildId)" \
+                  --location "${{ parameters.location }}" \
+                  --parameters infra/params/dev.bicepparam \
+                  --output none
+                echo "Template validated. Pending changes:"
+                az deployment sub what-if \
+                  --name "ocrai-whatif-$(Build.BuildId)" \
+                  --location "${{ parameters.location }}" \
+                  --parameters infra/params/dev.bicepparam

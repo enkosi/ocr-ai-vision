@@ -1,0 +1,89 @@
+# -----------------------------------------------------------------------------
+#  Build stage — compile, test, publish, package. Runs once per pipeline run;
+#  every environment downstream deploys this exact artifact.
+# -----------------------------------------------------------------------------
+parameters:
+  - name: buildConfiguration
+    type: string
+    default: Release
+  - name: dotnetVersion
+    type: string
+    default: '8.0.x'
+  - name: vmImage
+    type: string
+    default: ubuntu-latest
+
+stages:
+  - stage: Build
+    displayName: Build and test
+    jobs:
+      - job: BuildJob
+        displayName: Build, test, package
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          - task: UseDotNet@2
+            displayName: Install .NET SDK
+            inputs:
+              packageType: sdk
+              version: ${{ parameters.dotnetVersion }}
+
+          - script: dotnet restore OcrAiVision.sln
+            displayName: Restore
+
+          - script: >-
+              dotnet build OcrAiVision.sln
+              --configuration ${{ parameters.buildConfiguration }}
+              --no-restore
+            displayName: Build
+
+          - script: >-
+              dotnet test OcrAiVision.sln
+              --configuration ${{ parameters.buildConfiguration }}
+              --no-build
+              --logger trx
+              --collect:"XPlat Code Coverage"
+              --results-directory $(Agent.TempDirectory)/TestResults
+            displayName: Test
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: '**/*.trx'
+              searchFolder: $(Agent.TempDirectory)/TestResults
+              failTaskOnFailedTests: true
+
+          - task: PublishCodeCoverageResults@2
+            displayName: Publish code coverage
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: $(Agent.TempDirectory)/TestResults/**/coverage.cobertura.xml
+
+          - script: >-
+              dotnet publish src/OcrAiVision.Api/OcrAiVision.Api.csproj
+              --configuration ${{ parameters.buildConfiguration }}
+              --no-build
+              --output $(Build.ArtifactStagingDirectory)/api
+            displayName: Publish API
+
+          - task: ArchiveFiles@2
+            displayName: Package API
+            inputs:
+              rootFolderOrFile: $(Build.ArtifactStagingDirectory)/api
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/OcrAiVision.Api.zip
+              replaceExistingArchive: true
+
+          # The templates travel with the build. A deployment then applies the
+          # infrastructure that was reviewed alongside this code, not whatever
+          # main happens to hold when the stage eventually runs.
+          - publish: infra
+            artifact: infra
+            displayName: Publish Bicep templates
+
+          - publish: $(Build.ArtifactStagingDirectory)/OcrAiVision.Api.zip
+            artifact: api-package
+            displayName: Publish API package

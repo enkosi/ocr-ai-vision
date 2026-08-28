@@ -1,0 +1,85 @@
+# =============================================================================
+#  Azure DevOps — multi-stage pipeline
+#
+#  Stages:  Build ──> Validate ──> Dev ──> Test ──> Prod
+#
+#  A stage is a boundary you can approve, retry and read independently. Build
+#  produces the artifact once; each Deploy stage consumes that same artifact and
+#  differs only in which .bicepparam and which service connection it uses.
+#
+#  Prerequisites in the Azure DevOps project:
+#    * Service connections (workload identity federation, one per subscription):
+#        azure-ocrai-dev, azure-ocrai-test, azure-ocrai-prod
+#    * Environments (Pipelines > Environments), with approvals on 'ocrai-prod':
+#        ocrai-dev, ocrai-test, ocrai-prod
+# =============================================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    exclude:
+      - '**/*.md'
+      - docs/*
+      - '*.pptx'
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  - name: buildConfiguration
+    value: Release
+  - name: dotnetVersion
+    value: '8.0.x'
+  - name: azureLocation
+    value: southafricanorth
+  - name: vmImage
+    value: ubuntu-latest
+
+stages:
+  - template: .azuredevops/templates/build-stage.yml
+    parameters:
+      buildConfiguration: $(buildConfiguration)
+      dotnetVersion: $(dotnetVersion)
+      vmImage: $(vmImage)
+
+  # Compile and lint the templates, then run what-if against dev so a pull
+  # request can show the infrastructure diff before anyone merges it.
+  - template: .azuredevops/templates/validate-stage.yml
+    parameters:
+      serviceConnection: azure-ocrai-dev
+      location: $(azureLocation)
+      vmImage: $(vmImage)
+
+  - template: .azuredevops/templates/deploy-stage.yml
+    parameters:
+      stageName: Dev
+      environmentName: dev
+      azureDevOpsEnvironment: ocrai-dev
+      serviceConnection: azure-ocrai-dev
+      location: $(azureLocation)
+      vmImage: $(vmImage)
+      dependsOn: [Build, Validate]
+
+  - template: .azuredevops/templates/deploy-stage.yml
+    parameters:
+      stageName: Test
+      environmentName: test
+      azureDevOpsEnvironment: ocrai-test
+      serviceConnection: azure-ocrai-test
+      location: $(azureLocation)
+      vmImage: $(vmImage)
+      dependsOn: [Dev]
+
+  - template: .azuredevops/templates/deploy-stage.yml
+    parameters:
+      stageName: Prod
+      environmentName: prod
+      azureDevOpsEnvironment: ocrai-prod
+      serviceConnection: azure-ocrai-prod
+      location: $(azureLocation)
+      vmImage: $(vmImage)
+      dependsOn: [Test]
+      # Only main reaches production, whatever else the pipeline was run for.
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
