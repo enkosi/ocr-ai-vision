@@ -1,0 +1,85 @@
+# =============================================================================
+#  CI — runs on every pull request and every push to main.
+#
+#  Two jobs, deliberately independent: the application code and the
+#  infrastructure code are both code, and both get checked before they merge.
+#  Neither job touches Azure, so it also runs on pull requests from forks.
+# =============================================================================
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  DOTNET_NOLOGO: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore OcrAiVision.sln
+
+      # TreatWarningsAsErrors is on in Directory.Build.props, so this step is
+      # also the lint step — and ArchitectureTests turns a Clean Architecture
+      # violation into a failing test rather than a code-review argument.
+      - name: Build
+        run: dotnet build OcrAiVision.sln --configuration Release --no-restore
+
+      - name: Test
+        run: >-
+          dotnet test OcrAiVision.sln
+          --configuration Release
+          --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --collect:"XPlat Code Coverage"
+          --results-directory ${{ github.workspace }}/TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/**
+          retention-days: 7
+
+  validate-infrastructure:
+    name: Validate Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 'az bicep build' compiles the template to ARM JSON and runs the linter
+      # configured in infra/bicepconfig.json. A template that does not compile
+      # never reaches a deployment.
+      - name: Compile and lint templates
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          echo "main.bicep compiled"
+
+      - name: Compile parameter files
+        run: |
+          for environment in dev test prod; do
+            az bicep build-params \
+              --file "infra/params/${environment}.bicepparam" \
+              --stdout > /dev/null
+            echo "${environment}.bicepparam compiled"
+          done

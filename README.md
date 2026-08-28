@@ -163,6 +163,68 @@ dotnet run --project src/OcrAiVision.Api
 
 Then open `http://localhost:5133/swagger`.
 
+## Deployment
+
+Azure resources are provisioned by Bicep and applied by pipelines — nothing is
+created by hand, including the resource group and the RBAC assignment that lets
+the app authenticate without a key.
+
+```
+infra/main.bicep ──┬─ modules/monitoring.bicep                Log Analytics + App Insights
+                   ├─ modules/identity.bicep                  user-assigned managed identity
+                   ├─ modules/key-vault.bicep                 vault, secrets, audit log
+                   ├─ modules/document-intelligence.bicep     the AI account
+                   ├─ modules/document-intelligence-key.bicep listKeys() → vault (optional)
+                   ├─ modules/app-service.bicep               Linux plan, web app, staging slot
+                   └─ modules/role-assignments.bicep          identity → AI account and vault
+
+infra/params/{dev,test,prod}.bicepparam   the only per-environment difference
+```
+
+One template, three parameter files, and a pipeline that builds once and
+promotes the same artifact:
+
+```
+Build ──► Validate ──► Dev ──► Test ──► [approval] ──► Prod (slot swap)
+```
+
+Both dialects are included: `.github/workflows/` for GitHub Actions and
+`azure-pipelines.yml` + `.azuredevops/templates/` for Azure DevOps.
+
+```bash
+./scripts/setup-github-oidc.sh <subscription-id>   # one-time, passwordless auth
+./scripts/deploy-infra.sh dev --what-if            # preview a template change
+./scripts/deploy-infra.sh dev                      # apply it
+./scripts/set-secret.sh prod Third-Party-Api-Key   # write or rotate a secret
+```
+
+### Secrets
+
+Three separate problems, three answers:
+
+| Problem | Answer |
+| --- | --- |
+| How does the pipeline authenticate to Azure? | Workload identity federation (OIDC). Nothing stored. |
+| How does the app authenticate to Azure services? | A user-assigned managed identity. Nothing stored. |
+| Where do real secrets live? | Key Vault, read through App Service Key Vault references. |
+
+The web app runs as a managed identity with no `DocumentIntelligence:ApiKey`, so
+the adapter falls through to `DefaultAzureCredential` — there is no key to store
+or rotate. Anything that *is* a secret goes into a vault with RBAC
+authorisation, soft delete, purge protection in production, and every access
+audited; App Service resolves `@Microsoft.KeyVault(...)` settings itself, so the
+application code reads `IConfiguration` exactly as it does on a laptop and knows
+nothing about any of it.
+
+No secret appears in this repository, in a template output, or in deployment
+history: parameters carrying secrets are `@secure()`, values arrive from the
+pipeline's secret store through an environment variable, and the
+`outputs-should-not-contain-secrets` linter rule fails the build if one leaks
+into an output.
+
+**[docs/azure-cicd.md](docs/azure-cicd.md)** explains the templates, the stages,
+the OIDC trust and the one-time setup in full.
+
 ## Tests
 
 ```bash

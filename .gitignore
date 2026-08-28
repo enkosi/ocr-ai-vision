@@ -16,3 +16,7 @@ TestResults/
 # Local configuration and secrets
 appsettings.Local.json
 *.env
+
+# Bicep build output
+infra/**/*.json
+!infra/bicepconfig.json

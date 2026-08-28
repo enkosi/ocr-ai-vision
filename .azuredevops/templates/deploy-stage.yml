@@ -1,0 +1,181 @@
+# -----------------------------------------------------------------------------
+#  Deploy stage template — instantiated once per environment.
+#
+#  A 'deployment' job (rather than a plain 'job') is what binds the stage to an
+#  Azure DevOps Environment, which is where approvals, checks and deployment
+#  history live. Put a manual approval on the prod Environment and this same
+#  template pauses there and nowhere else.
+# -----------------------------------------------------------------------------
+parameters:
+  - name: stageName
+    type: string
+  - name: environmentName          # dev | test | prod — picks the .bicepparam
+    type: string
+  - name: azureDevOpsEnvironment   # Pipelines > Environments, carries approvals
+    type: string
+  - name: serviceConnection
+    type: string
+  - name: location
+    type: string
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: succeeded()
+  - name: vmImage
+    type: string
+    default: ubuntu-latest
+  - name: variableGroups
+    type: object
+    default: []
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: Deploy ${{ parameters.environmentName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      - deployment: Deploy${{ parameters.stageName }}
+        displayName: Provision and deploy
+        environment: ${{ parameters.azureDevOpsEnvironment }}
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        variables:
+          # A default so the deployment works with no secrets configured. A
+          # variable group listed below overrides it — and the best kind of
+          # variable group is one LINKED TO KEY VAULT (Library > Variable group
+          # > "Link secrets from an Azure key vault as variables"), which fetches
+          # values at queue time instead of storing a second copy of them in
+          # Azure DevOps.
+          - name: additionalSecretsJson
+            value: '{}'
+          - ${{ each variableGroup in parameters.variableGroups }}:
+              - group: ${{ variableGroup }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: infra
+                  displayName: Download templates
+
+                - download: current
+                  artifact: api-package
+                  displayName: Download API package
+
+                # ---------------------------------------------------------
+                # 1. Infrastructure first. The app cannot be deployed to a
+                #    site that does not exist yet, and its configuration
+                #    (the Document Intelligence endpoint) comes out of this
+                #    deployment's outputs.
+                # ---------------------------------------------------------
+                - task: AzureCLI@2
+                  name: infra
+                  displayName: Deploy Bicep
+                  env:
+                    # Read by readEnvironmentVariable() inside the .bicepparam.
+                    # Mapping it in 'env' rather than interpolating it into the
+                    # script is what keeps it out of the expanded command line.
+                    OCRAI_ADDITIONAL_SECRETS: $(additionalSecretsJson)
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      cd "$(Pipeline.Workspace)/infra"
+
+                      echo "--- what-if -------------------------------------"
+                      az deployment sub what-if \
+                        --name "ocrai-${{ parameters.environmentName }}-$(Build.BuildId)" \
+                        --location "${{ parameters.location }}" \
+                        --parameters "params/${{ parameters.environmentName }}.bicepparam"
+
+                      echo "--- deploy --------------------------------------"
+                      outputs=$(az deployment sub create \
+                        --name "ocrai-${{ parameters.environmentName }}-$(Build.BuildId)" \
+                        --location "${{ parameters.location }}" \
+                        --parameters "params/${{ parameters.environmentName }}.bicepparam" \
+                        --query properties.outputs \
+                        --output json)
+
+                      # Hand the template's outputs to the later steps as
+                      # pipeline variables.
+                      for key in resourceGroupName webAppName webAppUrl webAppSlotName; do
+                        value=$(echo "$outputs" | jq -r --arg k "$key" '.[$k].value // ""')
+                        echo "$key = $value"
+                        echo "##vso[task.setvariable variable=$key;isOutput=true]$value"
+                      done
+
+                # ---------------------------------------------------------
+                # 2. The application. Where a staging slot exists this lands
+                #    in the slot; otherwise straight into the site.
+                # ---------------------------------------------------------
+                - task: AzureWebApp@1
+                  displayName: Deploy API
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    appType: webAppLinux
+                    appName: $(infra.webAppName)
+                    deployToSlotOrASE: ${{ eq(parameters.environmentName, 'prod') }} # Only prod has a slot.
+                    resourceGroupName: $(infra.resourceGroupName)
+                    slotName: $(infra.webAppSlotName)
+                    package: $(Pipeline.Workspace)/api-package/OcrAiVision.Api.zip
+                    runtimeStack: 'DOTNETCORE|8.0'
+
+                # ---------------------------------------------------------
+                # 3. Prove it answers before it takes traffic.
+                # ---------------------------------------------------------
+                - bash: |
+                    set -euo pipefail
+                    app="$(infra.webAppName)"
+                    slot="$(infra.webAppSlotName)"
+                    if [ -n "$slot" ]; then
+                      target="https://${app}-${slot}.azurewebsites.net/health"
+                    else
+                      target="https://${app}.azurewebsites.net/health"
+                    fi
+
+                    echo "Probing ${target}"
+                    for attempt in $(seq 1 20); do
+                      status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$target" || echo 000)
+                      if [ "$status" = "200" ]; then
+                        echo "Healthy after ${attempt} attempt(s)."
+                        exit 0
+                      fi
+                      echo "Attempt ${attempt}: HTTP ${status} — retrying in 15s"
+                      sleep 15
+                    done
+                    echo "##vso[task.logissue type=error]${target} never returned 200."
+                    exit 1
+                  displayName: Smoke test /health
+
+                # ---------------------------------------------------------
+                # 4. Swap — production only, and only once the slot is warm
+                #    and healthy. Swapping back is the rollback.
+                # ---------------------------------------------------------
+                - task: AzureAppServiceManage@0
+                  displayName: Swap staging into production
+                  condition: and(succeeded(), ne(variables['infra.webAppSlotName'], ''))
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    action: 'Swap Slots'
+                    webAppName: $(infra.webAppName)
+                    resourceGroupName: $(infra.resourceGroupName)
+                    sourceSlot: $(infra.webAppSlotName)
+                    swapWithProduction: true
+
+                - bash: |
+                    set -euo pipefail
+                    target="$(infra.webAppUrl)/health"
+                    for attempt in $(seq 1 10); do
+                      status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$target" || echo 000)
+                      [ "$status" = "200" ] && { echo "Production healthy."; exit 0; }
+                      echo "Attempt ${attempt}: HTTP ${status} — retrying in 10s"
+                      sleep 10
+                    done
+                    echo "##vso[task.logissue type=error]Production did not come back healthy."
+                    exit 1
+                  displayName: Verify production after swap
+                  condition: and(succeeded(), ne(variables['infra.webAppSlotName'], ''))
