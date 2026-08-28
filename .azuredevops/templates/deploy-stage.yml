@@ -26,6 +26,9 @@ parameters:
   - name: vmImage
     type: string
     default: ubuntu-latest
+  - name: variableGroups
+    type: object
+    default: []
 
 stages:
   - stage: ${{ parameters.stageName }}
@@ -38,6 +41,17 @@ stages:
         environment: ${{ parameters.azureDevOpsEnvironment }}
         pool:
           vmImage: ${{ parameters.vmImage }}
+        variables:
+          # A default so the deployment works with no secrets configured. A
+          # variable group listed below overrides it — and the best kind of
+          # variable group is one LINKED TO KEY VAULT (Library > Variable group
+          # > "Link secrets from an Azure key vault as variables"), which fetches
+          # values at queue time instead of storing a second copy of them in
+          # Azure DevOps.
+          - name: additionalSecretsJson
+            value: '{}'
+          - ${{ each variableGroup in parameters.variableGroups }}:
+              - group: ${{ variableGroup }}
         strategy:
           runOnce:
             deploy:
@@ -59,6 +73,11 @@ stages:
                 - task: AzureCLI@2
                   name: infra
                   displayName: Deploy Bicep
+                  env:
+                    # Read by readEnvironmentVariable() inside the .bicepparam.
+                    # Mapping it in 'env' rather than interpolating it into the
+                    # script is what keeps it out of the expanded command line.
+                    OCRAI_ADDITIONAL_SECRETS: $(additionalSecretsJson)
                   inputs:
                     azureSubscription: ${{ parameters.serviceConnection }}
                     scriptType: bash

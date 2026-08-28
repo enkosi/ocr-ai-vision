@@ -74,14 +74,17 @@ jobs:
       # A what-if is a dry run: it reports Create/Modify/Delete/NoChange per
       # resource. Running it before the real deployment means the log shows what
       # changed even when the deployment itself succeeds silently.
+      #
+      # Secure parameters are redacted in this output — additionalSecrets shows
+      # as null rather than as its contents. That is the @secure() decorator
+      # doing its job, not a missing value.
       - name: Preview infrastructure changes (what-if)
+        env:
+          # Read by readEnvironmentVariable() inside the .bicepparam file. The
+          # secret never touches the repository, and GitHub masks it in the log
+          # if anything ever echoes it.
+          OCRAI_ADDITIONAL_SECRETS: ${{ secrets.ADDITIONAL_SECRETS_JSON }}
         run: |
-          az deployment sub what-if \
-            --name "ocrai-${{ inputs.environment }}-whatif-${{ github.run_number }}" \
-            --location "${{ inputs.location }}" \
-            --parameters "infra/params/${{ inputs.environment }}.bicepparam" \
-            --result-format FullResourcePayloads \
-            --no-pretty-print > whatif.json || true
           az deployment sub what-if \
             --name "ocrai-${{ inputs.environment }}-whatif-${{ github.run_number }}" \
             --location "${{ inputs.location }}" \
@@ -89,6 +92,8 @@ jobs:
 
       - name: Deploy infrastructure
         id: infra
+        env:
+          OCRAI_ADDITIONAL_SECRETS: ${{ secrets.ADDITIONAL_SECRETS_JSON }}
         run: |
           set -euo pipefail
 

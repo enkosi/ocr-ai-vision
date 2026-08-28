@@ -10,6 +10,16 @@ param useDeploymentSlot = false
 param alwaysOn = true
 param logRetentionInDays = 30
 param aspNetCoreEnvironment = 'Production'
+
+param keyVaultSoftDeleteRetentionInDays = 7
+param enableKeyVaultPurgeProtection = false
+
+param storeDocumentIntelligenceKeyInVault = false
+param useKeyBasedAuthentication = false
+
+// See dev.bicepparam for what this does and why it is not a literal.
+param additionalSecrets = json(readEnvironmentVariable('OCRAI_ADDITIONAL_SECRETS', '{}'))
+
 param additionalTags = {
   costCentre: 'engineering'
 }

@@ -83,4 +83,19 @@ Done. Add these to each GitHub Environment (Settings > Environments > dev|test|p
   AZURE_TENANT_ID        ${TENANT_ID}
   AZURE_SUBSCRIPTION_ID  ${SUBSCRIPTION_ID}
 
+Optional, per environment, if that environment has application secrets to place
+in Key Vault. The pipeline passes it to the .bicepparam through an environment
+variable; it is never written to a file in the repository:
+
+  ADDITIONAL_SECRETS_JSON   {"Some-Api-Key":"...","Other-Secret":"..."}
+
+Note on Key Vault permissions. The two subscription-scope roles above are enough
+to DEPLOY, including creating secrets, because Bicep creates them through the ARM
+control plane. Reading or rotating a secret VALUE afterwards ('az keyvault secret
+set', the portal's secret blade) is a data-plane operation needing 'Key Vault
+Secrets Officer'. Rather than widening the roles above, grant it per vault by
+passing this object ID to the template's secretsOfficerPrincipalIds parameter:
+
+  ${PRINCIPAL_ID}
+
 SUMMARY

@@ -12,6 +12,11 @@
 #        azure-ocrai-dev, azure-ocrai-test, azure-ocrai-prod
 #    * Environments (Pipelines > Environments), with approvals on 'ocrai-prod':
 #        ocrai-dev, ocrai-test, ocrai-prod
+#    * Optionally, variable groups holding secrets — ideally LINKED TO KEY VAULT
+#      rather than storing the values in Azure DevOps. Pass them per stage with
+#      'variableGroups: [ocrai-prod-secrets]'; see .azuredevops/templates/
+#      deploy-stage.yml. Nothing here requires one: with no group the
+#      deployment runs with no additional secrets.
 # =============================================================================
 
 trigger:

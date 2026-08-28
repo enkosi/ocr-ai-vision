@@ -27,6 +27,12 @@ param useDeploymentSlot bool = false
 @description('Value of ASPNETCORE_ENVIRONMENT.')
 param aspNetCoreEnvironment string = 'Production'
 
+@description('Resource ID of the user-assigned managed identity the app runs as.')
+param managedIdentityId string
+
+@description('Client ID of that identity. DefaultAzureCredential needs it to pick the right one.')
+param managedIdentityClientId string
+
 @description('Application Insights connection string.')
 param appInsightsConnectionString string
 
@@ -42,6 +48,13 @@ param defaultModelId string
 @description('Largest upload the API will accept, in bytes.')
 param maxUploadSizeInBytes int
 
+@description('''
+Versionless Key Vault secret URI holding the Document Intelligence key. Empty —
+the default and the recommended setting — means the app authenticates with its
+managed identity instead.
+''')
+param documentIntelligenceApiKeySecretUri string = ''
+
 var slotName = 'staging'
 
 // ASP.NET Core reads nested configuration from environment variables using a
@@ -49,14 +62,16 @@ var slotName = 'staging'
 // here binds to the same option as "DocumentIntelligence:Endpoint" in
 // appsettings.json — and wins over it, because environment variables sit higher
 // in the configuration precedence chain.
-//
-// Note what is NOT here: DocumentIntelligence__ApiKey. Leaving it unset is what
-// makes the adapter fall through to DefaultAzureCredential and use the managed
-// identity below.
-var appSettings = [
+var baseAppSettings = [
   {
     name: 'ASPNETCORE_ENVIRONMENT'
     value: aspNetCoreEnvironment
+  }
+  {
+    // Without this, DefaultAzureCredential cannot tell which user-assigned
+    // identity to present when a resource has more than one available.
+    name: 'AZURE_CLIENT_ID'
+    value: managedIdentityClientId
   }
   {
     name: 'DocumentIntelligence__Endpoint'
@@ -90,6 +105,29 @@ var appSettings = [
   }
 ]
 
+// A KEY VAULT REFERENCE. App Service resolves this itself, using the identity
+// named by keyVaultReferenceIdentity, and hands the *value* to the process as
+// an ordinary environment variable. The application needs no Key Vault SDK, no
+// vault URI and no awareness that any of this is happening — it reads
+// DocumentIntelligence:ApiKey from IConfiguration exactly as it does locally.
+//
+// The URI carries no version, which is what makes rotation work: write a new
+// version into the vault and App Service picks it up within 24 hours (or
+// immediately on restart) with no redeployment.
+//
+// Note that this is empty by default. The absence of this setting is what makes
+// AzureDocumentIntelligenceOptions.UsesManagedIdentity return true.
+var keyVaultReferenceSettings = empty(documentIntelligenceApiKeySecretUri)
+  ? []
+  : [
+      {
+        name: 'DocumentIntelligence__ApiKey'
+        value: '@Microsoft.KeyVault(SecretUri=${documentIntelligenceApiKeySecretUri})'
+      }
+    ]
+
+var appSettings = concat(baseAppSettings, keyVaultReferenceSettings)
+
 var siteConfig = {
   linuxFxVersion: 'DOTNETCORE|8.0'
   alwaysOn: alwaysOn
@@ -98,6 +136,15 @@ var siteConfig = {
   ftpsState: 'Disabled'
   healthCheckPath: '/health'
   appSettings: appSettings
+}
+
+// One identity, attached to both the site and its slot, already holding its
+// role assignments before either exists.
+var identityConfiguration = {
+  type: 'UserAssigned'
+  userAssignedIdentities: {
+    '${managedIdentityId}': {}
+  }
 }
 
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
@@ -118,13 +165,15 @@ resource site 'Microsoft.Web/sites@2023-12-01' = {
   location: location
   tags: tags
   kind: 'app,linux'
-  identity: {
-    type: 'SystemAssigned'
-  }
+  identity: identityConfiguration
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
     clientAffinityEnabled: false
+    // Which identity App Service uses to resolve @Microsoft.KeyVault(...)
+    // settings. Left unset it would use the system-assigned identity, which
+    // this app does not have.
+    keyVaultReferenceIdentity: managedIdentityId
     siteConfig: siteConfig
   }
 }
@@ -135,13 +184,12 @@ resource stagingSlot 'Microsoft.Web/sites/slots@2023-12-01' = if (useDeploymentS
   location: location
   tags: tags
   kind: 'app,linux'
-  identity: {
-    type: 'SystemAssigned'
-  }
+  identity: identityConfiguration
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
     clientAffinityEnabled: false
+    keyVaultReferenceIdentity: managedIdentityId
     siteConfig: siteConfig
   }
 }
@@ -178,15 +226,6 @@ resource siteDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-previ
   }
 }
 
-// The slot runs the same code against the same Document Intelligence account,
-// so it needs the same data-plane role. Safe dereference (.?) yields null when
-// the slot was not deployed, and the filter drops it.
-var slotPrincipalId = stagingSlot.?identity.?principalId ?? ''
-
 output webAppName string = site.name
 output webAppUrl string = 'https://${site.properties.defaultHostName}'
 output slotName string = useDeploymentSlot ? slotName : ''
-output principalIds array = filter(
-  [site.identity.principalId, slotPrincipalId],
-  principalId => !empty(principalId)
-)
